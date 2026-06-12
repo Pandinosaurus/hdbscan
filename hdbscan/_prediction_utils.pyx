@@ -1,4 +1,5 @@
-#cython: boundscheck=False, nonecheck=False, initializedcheck=False
+# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
+# cython: boundscheck=False, nonecheck=False, initializedcheck=False
 # Utility routines in cython for prediction in hdbscan
 # Authors: Leland McInnes
 # License: 3-clause BSD
@@ -6,7 +7,7 @@
 import numpy as np
 cimport numpy as np
 
-from dist_metrics cimport DistanceMetric
+from hdbscan.dist_metrics cimport DistanceMetric
 
 from libc.float cimport DBL_MAX
 from libc.math cimport exp

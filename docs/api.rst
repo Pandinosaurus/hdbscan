@@ -36,3 +36,15 @@ and the prediction module.
 
 .. automodule:: hdbscan.prediction
    :members:
+
+
+Branch detection
+----------------
+
+The branches module contains classes for detecting branches within clusters.
+
+.. automodule:: hdbscan.branches
+   :members: BranchDetector, detect_branches_in_clusters, approximate_predict_branch
+
+.. autoclass:: hdbscan.plots.ApproximationGraph
+   :members:

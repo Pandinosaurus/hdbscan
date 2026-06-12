@@ -32,10 +32,12 @@ from warnings import warn
 import numpy as np
 from ._hdbscan_tree import compute_stability, get_cluster_tree_leaves
 from .hdbscan_ import HDBSCAN, _tree_to_labels
-from .plots import _bfs_from_cluster_tree
+from .plots import _bfs_from_cluster_tree, _get_leaves
 from .prediction import (PredictionData,
+                         _cluster_tree_lookup,
                          _find_cluster_and_probability,
-                         _find_neighbor_and_lambda)
+                         _find_neighbor_and_lambda,
+                         _group_by_parent)
 from ._prediction_utils import (get_tree_row_with_child,
                                 dist_membership_vector,
                                 outlier_membership_vector,
@@ -145,7 +147,12 @@ def HDBSCAN_flat(X, n_clusters=None,
 
     if new_clusterer.cluster_selection_method == 'eom':
         max_eom_clusters = len(
-                new_clusterer.condensed_tree_._select_clusters())
+            _new_select_clusters(
+                new_clusterer.condensed_tree_,
+                new_clusterer.cluster_selection_method,
+                new_clusterer.allow_single_cluster
+            )
+        )
 
     # Pick an epsilon value right after a split produces n_clusters,
     #   and the don't split further for smaller epsilon (larger lambda)
@@ -155,7 +162,11 @@ def HDBSCAN_flat(X, n_clusters=None,
             warn(f"Cannot predict more than {max_eom_clusters} with cluster "
                  "selection method 'eom'. Changing to method 'leaf'...")
             new_clusterer.cluster_selection_method = 'leaf'
-        epsilon = select_epsilon(new_clusterer.condensed_tree_, n_clusters)
+        epsilon = select_epsilon(
+            new_clusterer.condensed_tree_, 
+            new_clusterer.cluster_selection_method, 
+            n_clusters
+        )
     else:
         # Or use the specified cluster_selection_epsilon
         epsilon = cluster_selection_epsilon
@@ -190,6 +201,7 @@ def HDBSCAN_flat(X, n_clusters=None,
     # A function re_init is defined in this module to handle this.
     re_init(new_clusterer.prediction_data_,
             new_clusterer.condensed_tree_,
+            new_clusterer.cluster_selection_method,
             cluster_selection_epsilon=epsilon)
     return new_clusterer
 
@@ -301,14 +313,15 @@ def approximate_predict_flat(clusterer,
         prediction_data = copy.deepcopy(prediction_data)
         # Cluster selection method is hold by condensed_tree.
         # Change from 'eom' to 'leaf' if n_clusters is too large.
-        if ((condensed_tree.cluster_selection_method == 'eom') and (
+        if ((clusterer.cluster_selection_method == 'eom') and (
                 (n_clusters is not None) and (n_clusters > n_clusters_fit))):
             warn(f"Cannot predict more than {n_clusters_fit} with cluster "
                  "selection method 'eom'. Changing to method 'leaf'...")
-            condensed_tree.cluster_selection_method = 'leaf'
+            clusterer.cluster_selection_method = 'leaf'
         # This change does not affect the tree associated with 'clusterer'
         # Re-initialize prediction_data for the specified n_clusters or epsilon
         re_init(prediction_data, condensed_tree,
+                clusterer.cluster_selection_method,
                 n_clusters=n_clusters,
                 cluster_selection_epsilon=cluster_selection_epsilon)
 
@@ -339,16 +352,23 @@ def approximate_predict_flat(clusterer,
                                               points_to_predict,
                                               k=2 * min_samples)
 
+    cluster_tree = prediction_data.cluster_tree
+    # Build the child -> (parent, lambda) lookup and root once, not per point.
+    cluster_tree_lookup = _cluster_tree_lookup(cluster_tree)
+    tree_root = cluster_tree['parent'].min()
+
     for i in range(points_to_predict.shape[0]):
-        label, prob = _find_cluster_and_probability(
+        label, prob, neighbors = _find_cluster_and_probability(
             condensed_tree,
-            prediction_data.cluster_tree,
+            cluster_tree,
             neighbor_indices[i],
             neighbor_distances[i],
             prediction_data.core_distances,
             prediction_data.cluster_map,
             prediction_data.max_lambdas,
-            min_samples
+            min_samples,
+            cluster_tree_lookup,
+            tree_root,
         )
         labels[i] = label
         probabilities[i] = prob
@@ -427,18 +447,28 @@ def membership_vector_flat(
             #   produces a specified number of n_clusters
             # With method 'eom', we may fail to get 'n_clusters' clusters. So,
             try:
-                epsilon = select_epsilon(condensed_tree, n_clusters)
+                epsilon = select_epsilon(
+                    condensed_tree, 
+                    clusterer.cluster_selection_method,
+                    n_clusters
+                )
             except AssertionError:
                 warn(f"Failed to predict {n_clusters} clusters with "
                      "cluster selection method 'eom'. Switching to 'leaf'...")
-                condensed_tree.cluster_selection_method = 'leaf'
-                epsilon = select_epsilon(condensed_tree, n_clusters)
+                clusterer.cluster_selection_method = 'leaf'
+                epsilon = select_epsilon(
+                    condensed_tree, 
+                    clusterer.cluster_selection_method,
+                    n_clusters
+                )
         else:
             epsilon = cluster_selection_epsilon
         # Create another instance of prediction_data that is consistent
         #   with the selected value of epsilon.
         prediction_data = copy.deepcopy(clusterer.prediction_data_)
-        re_init(prediction_data, condensed_tree,
+        re_init(prediction_data, 
+                condensed_tree,
+                clusterer.cluster_selection_method,
                 cluster_selection_epsilon=epsilon)
 
     # Flat clustering from prediction data
@@ -573,18 +603,23 @@ def all_points_membership_vectors_flat(
             #   produces a specified number of n_clusters
             # With method 'eom', we may fail to get 'n_clusters' clusters. So,
             try:
-                epsilon = select_epsilon(condensed_tree, n_clusters)
+                epsilon = select_epsilon(
+                    condensed_tree, clusterer.cluster_selection_method, n_clusters
+                )
             except AssertionError:
                 warn(f"Failed to predict {n_clusters} clusters with "
                      "cluster selection method 'eom'. Switching to 'leaf'...")
-                condensed_tree.cluster_selection_method = 'leaf'
-                epsilon = select_epsilon(condensed_tree, n_clusters)
+                clusterer.cluster_selection_method = 'leaf'
+                epsilon = select_epsilon(
+                    condensed_tree, clusterer.cluster_selection_method,  n_clusters
+                )
         else:
             epsilon = cluster_selection_epsilon
         # Create another instance of prediction_data that is consistent
         #   with the selected value of epsilon.
         prediction_data = copy.deepcopy(clusterer.prediction_data_)
         re_init(prediction_data, condensed_tree,
+                clusterer.cluster_selection_method,
                 cluster_selection_epsilon=epsilon)
 
     # Flat clustering at the chosen epsilon from prediction_data
@@ -631,12 +666,11 @@ def all_points_membership_vectors_flat(
     return membership_vectors
 
 
-def select_epsilon(condensed_tree, n_clusters):
+def select_epsilon(condensed_tree, cluster_selection_method, n_clusters):
     """
     Pick optimal epsilon from condensed tree based on n_clusters,
         calls functions specific to 'eom' or 'leaf' selection methods
     """
-    cluster_selection_method = condensed_tree.cluster_selection_method
     if cluster_selection_method == 'eom':
         return select_epsilon_eom(condensed_tree, n_clusters)
     if cluster_selection_method == 'leaf':
@@ -653,10 +687,10 @@ def select_epsilon_eom(condensed_tree, n_clusters):
     """
     # With method 'eom', max clusters are produced for epsilon=0,
     #   as computed by
-    eom_base_clusters = condensed_tree._select_clusters()
+    eom_base_clusters = _new_select_clusters(condensed_tree, 'eom', False)
     max_clusters = len(eom_base_clusters)
-    # Increasing epsilon can only reduce the number of ouput clusters.
-
+    
+    # Increasing epsilon can only reduce the number of output clusters.
     assert n_clusters <= max_clusters, (
             f"Cannot produce more than {max_clusters} with method 'eom'. " +
             "Use method 'leaf' instead to extract flat clustering.")
@@ -670,7 +704,7 @@ def select_epsilon_eom(condensed_tree, n_clusters):
     candidate_epsilons = np.sort(candidate_epsilons)[::-1]
 
     for epsilon in candidate_epsilons:
-        sel_clusters = _new_select_clusters(condensed_tree, epsilon)
+        sel_clusters = _new_select_clusters(condensed_tree, 'eom', epsilon)
         if len(sel_clusters) == n_clusters:
             break
     else:
@@ -714,7 +748,9 @@ def select_epsilon_leaf(condensed_tree, n_clusters):
 
 
 def re_init(predData, condensed_tree,
-            n_clusters=None, cluster_selection_epsilon=0.):
+            cluster_selection_method,
+            n_clusters=None, 
+            cluster_selection_epsilon=0.):
     """
     Modify PredictionData of HDBSCAN to account for epsilon.
     epsilon is the cluster_selection_epsilon that controls granularity
@@ -745,11 +781,14 @@ def re_init(predData, condensed_tree,
     # predData must be a pre-trained PredictionData instance from hdbscan
     # If n_clusters is specified, compute cluster_selection_epsilon;
     if (n_clusters is not None):
-        cluster_selection_epsilon = select_epsilon(condensed_tree, n_clusters)
+        cluster_selection_epsilon = select_epsilon(
+            condensed_tree, cluster_selection_method, n_clusters
+        )
 
     # This is the key modification:
     # Select clusters according to selection method and epsilon.
     selected_clusters = _new_select_clusters(condensed_tree,
+                                             cluster_selection_method,
                                              cluster_selection_epsilon)
     # _new_select_clusters is a modification of get_clusters
     #   from hdbscan._hdbscan_tree
@@ -768,11 +807,13 @@ def re_init(predData, condensed_tree,
     predData.max_lambdas = {}
     predData.exemplars = []
 
+    # Group the raw tree by parent once instead of re-scanning it per
+    # cluster/leaf below (see hdbscan.prediction._group_by_parent).
+    group_max_lambda, group_rows = _group_by_parent(raw_condensed_tree)
+
     for cluster in selected_clusters:
         # max_lambda <=> smallest distance <=> most persistent point(s)
-        predData.max_lambdas[cluster] = \
-                    raw_condensed_tree['lambda_val'][
-                        raw_condensed_tree['parent'] == cluster].max()
+        predData.max_lambdas[cluster] = group_max_lambda[cluster]
 
         # Map all sub-clusters of selected cluster to the selected cluster's
         #       label in output.
@@ -788,12 +829,12 @@ def re_init(predData, condensed_tree,
         #       and leaves of leaves, and so on...
         for leaf in predData._recurse_leaf_dfs(cluster):
             # Largest lambda => Most persistent points
-            leaf_max_lambda = raw_condensed_tree['lambda_val'][
-                raw_condensed_tree['parent'] == leaf].max()
+            leaf_rows = group_rows[leaf]
+            leaf_max_lambda = group_max_lambda[leaf]
             # Get the most persistent points
             points = raw_condensed_tree['child'][
-                (raw_condensed_tree['parent'] == leaf)
-                & (raw_condensed_tree['lambda_val'] == leaf_max_lambda)
+                leaf_rows[raw_condensed_tree['lambda_val'][leaf_rows]
+                          == leaf_max_lambda]
             ]
             # Add most persistent points as exemplars
             cluster_exemplars = np.hstack([cluster_exemplars, points])
@@ -804,6 +845,7 @@ def re_init(predData, condensed_tree,
 
 
 def _new_select_clusters(condensed_tree,
+                         cluster_selection_method,
                          cluster_selection_epsilon,
                          allow_single_cluster=False,
                          match_reference_implementation=False):
@@ -813,7 +855,6 @@ def _new_select_clusters(condensed_tree,
         and returns only the selected clusters instead.
     """
     tree = condensed_tree._raw_tree
-    cluster_selection_method = condensed_tree.cluster_selection_method
     stability = compute_stability(tree)
 
     if allow_single_cluster:

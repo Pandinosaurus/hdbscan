@@ -1,151 +1,223 @@
-# Python package
-# Create and test a Python package on multiple Python versions.
-# Add steps that analyze code, save the dist with the build record, publish to a PyPI-compatible index, and more:
-# https://docs.microsoft.com/azure/devops/pipelines/languages/python
-
+# Trigger a build when there is a push to the main branch or a tag starts with release-
 trigger:
-- master
+  branches:
+    include:
+    - master
+  tags:
+    include:
+    - release-*
 
-jobs:
-  - job: Linux
-    pool:
-      vmImage: ubuntu-latest
-    strategy:
-      matrix:
-        Python37:
-          python.version: '3.7'
-        Python38:
-          python.version: '3.8'
-        Python39:
-          python.version: '3.9'
+# Trigger a build when there is a pull request to the main branch
+# Ignore PRs that are just updating the docs
+pr:
+  branches:
+    include:
+    - master
+    exclude:
+    - doc/*
+    - README.rst
 
-    steps:
-      - task: UsePythonVersion@0
-        inputs:
-          versionSpec: '$(python.version)'
-        displayName: 'Use Python $(python.version)'
+variables:
+  triggeredByPullRequest: $[eq(variables['Build.Reason'], 'PullRequest')]
 
-      - script: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-        displayName: 'Install dependencies'
+stages:
+  - stage: RunAllTests
+    displayName: Run test suite
+    jobs:
+      - job: run_platform_tests
+        strategy:
+          matrix:
+            mac_py310:
+              imageName: 'macOS-latest'
+              python.version: '3.10'
+            linux_py310:
+              imageName: 'ubuntu-latest'
+              python.version: '3.10'
+            windows_py310:
+              imageName: 'windows-latest'
+              python.version: '3.10'
+            mac_py311:
+              imageName: 'macOS-latest'
+              python.version: '3.11'
+            linux_py311:
+              imageName: 'ubuntu-latest'
+              python.version: '3.11'
+            windows_py311:
+              imageName: 'windows-latest'
+              python.version: '3.11'
+            mac_py312:
+              imageName: 'macOS-latest'
+              python.version: '3.12'
+            linux_py312:
+              imageName: 'ubuntu-latest'
+              python.version: '3.12'
+            windows_py312:
+              imageName: 'windows-latest'
+              python.version: '3.12'
+            mac_py313:
+              imageName: 'macOS-latest'
+              python.version: '3.13'
+            linux_py313:
+              imageName: 'ubuntu-latest'
+              python.version: '3.13'
+            windows_py313:
+              imageName: 'windows-latest'
+              python.version: '3.13'
+            mac_py314:
+              imageName: 'macOS-latest'
+              python.version: '3.14'
+            linux_py314:
+              imageName: 'ubuntu-latest'
+              python.version: '3.14'
+            windows_py314:
+              imageName: 'windows-latest'
+              python.version: '3.14'
+        pool:
+          vmImage: $(imageName)
 
-      - script: |
-          pip install cython
-          python setup.py develop
+        steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '$(python.version)'
+          displayName: 'Use Python $(python.version)'
 
-      - script: |
-          pip install pytest pytest-azurepipelines
-          pytest
-        displayName: 'pytest'
+        - script: |
+            python -m pip install --upgrade pip
+          displayName: 'Upgrade pip'
 
-      - task: PublishTestResults@2
-        inputs:
-          testResultsFiles: 'pytest.xml'
-          testRunTitle: '$(Agent.OS) - $(Build.BuildNumber)[$(Agent.JobName)] - Python $(python.version)'
-        condition: succeededOrFailed()
+        - script: |
+            python -m pip install -U uv
+            uv sync --group cicd
+          displayName: 'Install package and dependencies'
 
-  - job: Windows
-    pool:
-      vmImage: 'windows-latest'
-    strategy:
-      matrix:
-        Python36:
-          python.version: '3.6'
-        Python37:
-          python.version: '3.7'
-        Python38:
-          python.version: '3.8'
-        Python39:
-          python.version: '3.9'
+        - script: |
+            uv run pytest hdbscan/tests --show-capture=no -v --disable-warnings --junitxml=junit/test-results.xml --cov=hdbscan/ --cov-report=xml --cov-report=html
+          displayName: 'Run tests'
 
-    steps:
-      - task: UsePythonVersion@0
-        inputs:
-          versionSpec: '$(python.version)'
-        displayName: 'Use Python $(python.version)'
+        - task: PublishTestResults@2
+          inputs:
+            testResultsFiles: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+            testRunTitle: '$(Agent.OS) - $(Build.BuildNumber)[$(Agent.JobName)] - Python $(python.version)'
+          condition: succeededOrFailed()
 
-      - script: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-        displayName: 'Install dependencies'
+  - stage: BuildPublishArtifact
+    dependsOn: RunAllTests
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/release-'), eq(variables.triggeredByPullRequest, false))
+    jobs:
+      # Need to use manylinux as ubuntu-latest is too new
+      - job: Manylinux_2_28_Build
+        pool:
+          vmImage: 'ubuntu-latest'
+        container: quay.io/pypa/manylinux_2_28_x86_64:latest
+        strategy:
+          matrix:
+            linux_py310:
+              python.version: 'cp310-cp310'
+            linux_py311:
+              python.version: 'cp311-cp311'
+            linux_py312:
+              python.version: 'cp312-cp312'
+            linux_py313:
+              python.version: 'cp313-cp313'
+        steps:
+        - script: |
+            "${PYBIN}/python" -m pip install --upgrade pip
+            "${PYBIN}/python" -m pip install uv
+            "${PYBIN}/python" -m pip install wheel
+            uv sync
+          displayName: 'Install dependencies and build tools'
+          env:
+            PYBIN: /opt/python/$(python.version)/bin
+        - script: |
+            uv build --no-sources --sdist --wheel
+          displayName: 'Build wheels'
+          env:
+            PYBIN: /opt/python/$(python.version)/bin
+        - bash: |
+            auditwheel repair dist/*linux_x86_64.whl --plat manylinux_2_28_x86_64 -w wheelhouse-manylinux/
+          displayName: 'Audit wheels'
+        
+        - task: DownloadSecureFile@1
+          name: PYPIRC_CONFIG
+          displayName: 'Download pypirc'
+          inputs:
+            secureFile: 'pypirc'  
+        
+        - bash: |
+            "${PYBIN}/python" -m pip install twine
+            "${PYBIN}/python" -m twine upload -r pypi --config-file $(PYPIRC_CONFIG.secureFilePath) --skip-existing --disable-progress-bar wheelhouse-manylinux/*
+            "${PYBIN}/python" -m twine upload -r pypi --config-file $(PYPIRC_CONFIG.secureFilePath) --skip-existing --disable-progress-bar dist/*.tar.gz
+          displayName: 'Publish wheel to PyPi'
+          env:
+            PYBIN: /opt/python/$(python.version)/bin
 
-      - script: |
-          pip install cython
-          python setup.py develop
+      - job: BuildWindowsAndMacOSArtifacts
+        displayName: Build source dists and wheels for windows and macOS
+        strategy:
+          matrix:        
+            mac_py310:
+              imageName: 'macOS-latest'
+              python.version: '3.10'
+            windows_py310:
+              imageName: 'windows-latest'
+              python.version: '3.10'
+            mac_py311:
+              imageName: 'macOS-latest'
+              python.version: '3.11'
+            windows_py311:
+              imageName: 'windows-latest'
+              python.version: '3.11'
+            mac_py312:
+              imageName: 'macOS-latest'
+              python.version: '3.12'
+            windows_py312:
+              imageName: 'windows-latest'
+              python.version: '3.12'
+            mac_py313:
+              imageName: 'macOS-latest'
+              python.version: '3.13'
+            windows_py313:
+              imageName: 'windows-latest'
+              python.version: '3.13'
+        pool:
+          vmImage: $(imageName) 
 
-      - script: |
-          pip install pytest pytest-azurepipelines
-          pytest
-        displayName: 'pytest'
+        steps:
+        - task: UsePythonVersion@0
+          inputs:
+            versionSpec: '$(python.version)'
+          displayName: 'Use Python $(python.version)'
 
-  - job: MacOS
-    pool:
-      vmImage: 'macos-latest'
-    strategy:
-      matrix:
-        Python37:
-          python.version: '3.7'
-        Python38:
-          python.version: '3.8'
-        Python39:
-          python.version: '3.9'
+        - script: |
+            python -m pip install --upgrade pip
+            pip install uv
+            uv sync
+          displayName: 'Install dependencies'
+        
+        - bash: |
+            uv build --no-sources --sdist --wheel
+          displayName: 'Build package'
 
-    steps:
-      - task: UsePythonVersion@0
-        inputs:
-          versionSpec: '$(python.version)'
-        displayName: 'Use Python $(python.version)'
+        - bash: |
+            export PACKAGE_VERSION="$(uv version --short)"
+            echo "Package Version: ${PACKAGE_VERSION}"
+            echo "##vso[task.setvariable variable=packageVersionFormatted;]release-${PACKAGE_VERSION}"
+          displayName: 'Get package version'
 
-      - script: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-        displayName: 'Install dependencies'
+        - script: |
+            echo "Version in git tag $(Build.SourceBranchName) does not match version derived from setup.py $(packageVersionFormatted)"
+            exit 1
+          displayName: Raise error if version doesnt match tag
+          condition: and(succeeded(), ne(variables['Build.SourceBranchName'], variables['packageVersionFormatted']))
 
-      - script: |
-          pip install cython
-          python setup.py develop
+        - task: DownloadSecureFile@1
+          name: PYPIRC_CONFIG
+          displayName: 'Download pypirc'
+          inputs:
+            secureFile: 'pypirc'  
 
-      - script: |
-          pip install pytest pytest-azurepipelines
-          pytest
-        displayName: 'pytest'
-
-  - job: Coverage
-    pool:
-      vmImage: ubuntu-latest
-    strategy:
-      matrix:
-        Python39:
-          python.version: '3.9'
-
-    steps:
-      - task: UsePythonVersion@0
-        inputs:
-          versionSpec: '$(python.version)'
-        displayName: 'Use Python $(python.version)'
-
-      - script: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-        displayName: 'Install dependencies'
-
-      - script: |
-          pip install cython
-          pip install pytest
-          pip install pytest-cov
-          pip install coveralls
-          pip install codecov
-          python setup.py develop
-
-      - script: |
-          pip install pytest pytest-azurepipelines
-          pytest hdbscan/tests --show-capture=no -v --disable-warnings --junitxml=pytest.xml --cov=hdbscan/ --cov-report=xml --cov-report=html
-          codecov
-        displayName: 'pytest'
-
-      - task: PublishTestResults@2
-        inputs:
-          testResultsFiles: 'pytest.xml'
-          testRunTitle: '$(Agent.OS) - $(Build.BuildNumber)[$(Agent.JobName)] - Python $(python.version)'
-        condition: succeededOrFailed()
+        - script: |
+            uvx twine check dist/*
+            uvx twine upload --repository pypi --config-file $(PYPIRC_CONFIG.secureFilePath) --skip-existing dist/*
+          displayName: 'Upload to PyPI'
+          condition: and(succeeded(), eq(variables['Build.SourceBranchName'], variables['packageVersionFormatted']))

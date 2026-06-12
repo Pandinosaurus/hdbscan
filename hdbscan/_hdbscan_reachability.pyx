@@ -1,3 +1,4 @@
+# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: boundscheck=False
 # cython: nonecheck=False
 # cython: initializedcheck=False
@@ -50,13 +51,13 @@ def mutual_reachability(distance_matrix, min_points=5, alpha=1.0):
                                  axis=0)[min_points]
 
     if alpha != 1.0:
-        distance_matrix = distance_matrix / alpha
+        np.divide(distance_matrix, alpha, out=distance_matrix)
 
-    stage1 = np.where(core_distances > distance_matrix,
-                      core_distances, distance_matrix)
-    result = np.where(core_distances > stage1.T,
-                      core_distances.T, stage1.T).T
-    return result
+    # In-place on distance_matrix: avoids allocating any n*n intermediates.
+    # Callers do not use distance_matrix after this call.
+    np.maximum(distance_matrix, core_distances, out=distance_matrix)
+    np.maximum(distance_matrix, core_distances[:, None], out=distance_matrix)
+    return distance_matrix
 
 
 cpdef sparse_mutual_reachability(object lil_matrix, np.intp_t min_points=5,
@@ -79,7 +80,7 @@ cpdef sparse_mutual_reachability(object lil_matrix, np.intp_t min_points=5,
         if min_points - 1 < len(sorted_row_data):
             core_distance[i] = sorted_row_data[min_points - 1]
         else:
-            core_distance[i] = np.infty
+            core_distance[i] = np.inf
 
     if alpha != 1.0:
         lil_matrix = lil_matrix / alpha

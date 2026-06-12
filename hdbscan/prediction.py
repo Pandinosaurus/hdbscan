@@ -18,6 +18,74 @@ from ._prediction_utils import (get_tree_row_with_child,
 from warnings import warn
 
 
+def _group_by_parent(tree):
+    """Group a raw condensed tree by the ``parent`` field in a single pass.
+
+    The condensed tree stores one row per (parent, child) edge. A lot of the
+    prediction code needs, for a given ``parent`` cluster, the maximum
+    ``lambda_val`` over its rows (and sometimes the rows themselves). The
+    historical idiom did that with a fresh boolean-mask scan of the *whole*
+    tree for every cluster::
+
+        tree['lambda_val'][tree['parent'] == cluster].max()
+
+    which is O(n) per cluster, i.e. O(n * num_clusters) overall (and a clean
+    O(n^2) when looping over every distinct parent). This helper does the
+    grouping once: O(n log n) to sort by parent, then a single grouped reduce.
+
+    Parameters
+    ----------
+    tree : structured ndarray
+        A raw condensed tree with at least ``parent`` and ``lambda_val`` fields.
+
+    Returns
+    -------
+    max_lambda : dict {int parent -> float max lambda_val among its rows}
+
+    row_indices : dict {int parent -> ndarray of row indices with that parent}
+        Indices are in ascending (original-row) order, so downstream selection
+        preserves the same ordering as the old boolean-mask approach.
+    """
+    parents = tree['parent']
+    if len(parents) == 0:
+        return {}, {}
+
+    # Stable sort keeps original row order within each parent group, so the
+    # row_indices arrays match the order a boolean mask would have produced.
+    order = np.argsort(parents, kind='stable')
+    sorted_parents = parents[order]
+    # boundaries[k] = first row of the k-th distinct parent in sorted order.
+    boundaries = np.concatenate((
+        [0],
+        np.flatnonzero(sorted_parents[1:] != sorted_parents[:-1]) + 1,
+    ))
+    keys = sorted_parents[boundaries]
+
+    group_max = np.maximum.reduceat(tree['lambda_val'][order], boundaries)
+    max_lambda = dict(zip(keys, group_max.tolist()))
+    # np.split returns views into `order` (no copy) -> one index array per parent
+    row_indices = dict(zip(keys, np.split(order, boundaries[1:])))
+    return max_lambda, row_indices
+
+
+def _cluster_tree_lookup(cluster_tree):
+    """Map each cluster's ``child`` id to its ``(parent, lambda_val)``.
+
+    Lets the per-point walk-up in ``_find_cluster_and_probability`` find a
+    cluster's parent in O(1) instead of re-scanning ``cluster_tree['child'] ==
+    potential_cluster`` (an O(C) boolean mask plus two indexed copies) on every
+    step of every point. Built once per predict call; the dict holds C entries
+    (only clusters, not points), replacing the transient per-step masks, so
+    peak memory does not rise.
+    """
+    return {
+        int(child): (int(parent), lambda_val)
+        for child, parent, lambda_val in zip(
+            cluster_tree["child"], cluster_tree["parent"], cluster_tree["lambda_val"]
+        )
+    }
+
+
 class PredictionData(object):
     """
     Extra data that allows for faster prediction if cached.
@@ -81,7 +149,7 @@ class PredictionData(object):
         while to_process:
             result.extend(to_process)
             to_process = \
-                self.cluster_tree['child'][np.in1d(self.cluster_tree['parent'],
+                self.cluster_tree['child'][np.isin(self.cluster_tree['parent'],
                                                    to_process)]
             to_process = to_process.tolist()
 
@@ -118,28 +186,35 @@ class PredictionData(object):
         all_clusters = set(np.hstack([self.cluster_tree['parent'],
                                       self.cluster_tree['child']]))
 
+        # Group the raw tree by parent once instead of re-scanning it per
+        # cluster/leaf below (see _group_by_parent).
+        group_max_lambda, group_rows = _group_by_parent(raw_condensed_tree)
+
         for cluster in all_clusters:
-            self.leaf_max_lambdas[cluster] = raw_condensed_tree['lambda_val'][
-                raw_condensed_tree['parent'] == cluster].max()
+            self.leaf_max_lambdas[cluster] = group_max_lambda[cluster]
 
         for cluster in selected_clusters:
-            self.max_lambdas[cluster] = \
-                raw_condensed_tree['lambda_val'][raw_condensed_tree['parent'] == cluster].max()
+            self.max_lambdas[cluster] = group_max_lambda[cluster]
 
             for sub_cluster in self._clusters_below(cluster):
                 self.cluster_map[sub_cluster] = self.cluster_map[cluster]
                 self.max_lambdas[sub_cluster] = self.max_lambdas[cluster]
 
-            cluster_exemplars = np.array([], dtype=np.int64)
+            # Collect each leaf's exemplar points and concatenate once. The old
+            # code re-hstacked the growing array every iteration, copying all
+            # accumulated points each time (O(k^2) in the exemplar count).
+            exemplar_parts = []
             for leaf in self._recurse_leaf_dfs(cluster):
-                leaf_max_lambda = raw_condensed_tree['lambda_val'][
-                    raw_condensed_tree['parent'] == leaf].max()
+                leaf_rows = group_rows[leaf]
+                leaf_max_lambda = group_max_lambda[leaf]
                 points = raw_condensed_tree['child'][
-                    (raw_condensed_tree['parent'] == leaf)
-                    & (raw_condensed_tree['lambda_val'] == leaf_max_lambda)
+                    leaf_rows[raw_condensed_tree['lambda_val'][leaf_rows]
+                              == leaf_max_lambda]
                 ]
-                cluster_exemplars = np.hstack([cluster_exemplars, points])
+                exemplar_parts.append(points)
 
+            cluster_exemplars = (np.hstack(exemplar_parts) if exemplar_parts
+                                 else np.array([], dtype=np.int64))
             self.exemplars.append(self.raw_data[cluster_exemplars])
 
 
@@ -255,7 +330,8 @@ def _extend_condensed_tree(tree, neighbor_indices, neighbor_distances,
 def _find_cluster_and_probability(tree, cluster_tree, neighbor_indices,
                                   neighbor_distances, core_distances,
                                   cluster_map, max_lambdas,
-                                  min_samples):
+                                  min_samples, cluster_tree_lookup=None,
+                                  tree_root=None):
     """
     Return the cluster label (of the original clustering) and membership
     probability of a new data point.
@@ -290,7 +366,13 @@ def _find_cluster_and_probability(tree, cluster_tree, neighbor_indices,
         The min_samples value used to generate core distances.
     """
     raw_tree = tree._raw_tree
-    tree_root = cluster_tree['parent'].min()
+    # Callers predicting many points build the lookup/root once and pass them in
+    # (see approximate_predict); otherwise build them here. Either way the
+    # walk-up below has a single code path.
+    if cluster_tree_lookup is None:
+        cluster_tree_lookup = _cluster_tree_lookup(cluster_tree)
+    if tree_root is None:
+        tree_root = cluster_tree['parent'].min()
 
     nearest_neighbor, lambda_ = _find_neighbor_and_lambda(neighbor_indices,
                                                           neighbor_distances,
@@ -302,12 +384,15 @@ def _find_cluster_and_probability(tree, cluster_tree, neighbor_indices,
     potential_cluster = neighbor_tree_row['parent']
 
     if neighbor_tree_row['lambda_val'] > lambda_:
-        # Find appropriate cluster based on lambda of new point
-        while potential_cluster > tree_root and \
-                cluster_tree['lambda_val'][cluster_tree['child']
-                                           == potential_cluster] >= lambda_:
-            potential_cluster = cluster_tree['parent'][cluster_tree['child']
-                                                       == potential_cluster][0]
+        # Walk up to the appropriate cluster for the new point's lambda. Each
+        # step is an O(1) dict lookup of (parent, lambda_val); the original
+        # re-scanned ``cluster_tree['child'] == potential_cluster`` (an O(C)
+        # mask plus indexed copies) on every step of every point.
+        while potential_cluster > tree_root:
+            entry = cluster_tree_lookup.get(int(potential_cluster))
+            if entry is None or not (entry[1] >= lambda_):
+                break
+            potential_cluster = entry[0]
 
     if potential_cluster in cluster_map:
         cluster_label = cluster_map[potential_cluster]
@@ -325,10 +410,10 @@ def _find_cluster_and_probability(tree, cluster_tree, neighbor_indices,
     else:
         prob = 0.0
 
-    return cluster_label, prob
+    return cluster_label, prob, nearest_neighbor
 
 
-def approximate_predict(clusterer, points_to_predict):
+def approximate_predict(clusterer, points_to_predict, return_connecting_points=False):
     """Predict the cluster label of new points. The returned labels
     will be those of the original clustering found by ``clusterer``,
     and therefore are not (necessarily) the cluster labels that would
@@ -352,6 +437,10 @@ def approximate_predict(clusterer, points_to_predict):
         The new data points to predict cluster labels for. They should
         have the same dimensionality as the original dataset over which
         clusterer was fit.
+    
+    return_connecting_points : bool, optional
+        Whether to return the index of the nearest neighbor in the original
+        dataset for each of the ``points_to_predict``. Default is False
 
     Returns
     -------
@@ -360,6 +449,11 @@ def approximate_predict(clusterer, points_to_predict):
 
     probabilities : array (n_samples,)
         The soft cluster scores for each of the ``points_to_predict``
+
+    neighbors : array (n_samples,)
+        The index of the nearest neighbor in the original dataset for each
+        of the ``points_to_predict``. Only returned if 
+        ``return_connecting_points=True``.
 
     See Also
     --------
@@ -383,30 +477,46 @@ def approximate_predict(clusterer, points_to_predict):
              ' will be automatically predicted as noise.')
         labels = -1 * np.ones(points_to_predict.shape[0], dtype=np.int32)
         probabilities = np.zeros(points_to_predict.shape[0], dtype=np.float32)
+        if return_connecting_points:
+            neighbors = -1 * np.ones(points_to_predict.shape[0], dtype=np.int32)
+            return labels, probabilities, neighbors
         return labels, probabilities
 
     labels = np.empty(points_to_predict.shape[0], dtype=np.int32)
     probabilities = np.empty(points_to_predict.shape[0], dtype=np.float64)
+    if return_connecting_points:
+        neighbors = np.empty(points_to_predict.shape[0], dtype=np.int32)
 
     min_samples = clusterer.min_samples or clusterer.min_cluster_size
     neighbor_distances, neighbor_indices = \
         clusterer.prediction_data_.tree.query(points_to_predict,
                                               k=2 * min_samples)
 
+    cluster_tree = clusterer.prediction_data_.cluster_tree
+    # Build the child -> (parent, lambda) lookup and root once, not per point.
+    cluster_tree_lookup = _cluster_tree_lookup(cluster_tree)
+    tree_root = cluster_tree['parent'].min()
+
     for i in range(points_to_predict.shape[0]):
-        label, prob = _find_cluster_and_probability(
+        label, prob, neighbor = _find_cluster_and_probability(
             clusterer.condensed_tree_,
-            clusterer.prediction_data_.cluster_tree,
+            cluster_tree,
             neighbor_indices[i],
             neighbor_distances[i],
             clusterer.prediction_data_.core_distances,
             clusterer.prediction_data_.cluster_map,
             clusterer.prediction_data_.max_lambdas,
-            min_samples
+            min_samples,
+            cluster_tree_lookup,
+            tree_root,
         )
         labels[i] = label
         probabilities[i] = prob
+        if return_connecting_points:
+            neighbors[i] = neighbor
 
+    if return_connecting_points:
+        return labels, probabilities, neighbors
     return labels, probabilities
 
 
@@ -477,16 +587,14 @@ def approximate_predict_scores(clusterer, points_to_predict):
     parent_array = tree['parent']
 
     tree_root = parent_array.min()
-    max_lambdas = {}
-    for parent in np.unique(tree['parent']):
-        max_lambdas[parent] = tree[tree['parent'] == parent]['lambda_val'].max()
+    # Grouped max over parents in one pass (was an O(n^2) scan-per-parent loop).
+    max_lambdas, _ = _group_by_parent(tree)
 
-    for n in np.argsort(parent_array):
-        cluster = tree['child'][n]
-        if cluster < tree_root:
-            break
-
+    for n in range(tree.shape[0] - 1, -1, -1):
         parent = parent_array[n]
+        cluster = tree['child'][n]
+        if cluster not in max_lambdas:
+            continue
         if max_lambdas[cluster] > max_lambdas[parent]:
             max_lambdas[parent] = max_lambdas[cluster]
 

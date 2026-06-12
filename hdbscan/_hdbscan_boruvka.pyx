@@ -1,3 +1,4 @@
+# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: boundscheck=False
 # cython: nonecheck=False
 # cython: wraparound=False
@@ -65,8 +66,8 @@ from libc.math cimport fabs, pow
 
 from sklearn.neighbors import KDTree, BallTree
 
-import dist_metrics as dist_metrics
-cimport dist_metrics as dist_metrics
+import hdbscan.dist_metrics as dist_metrics
+cimport hdbscan.dist_metrics as dist_metrics
 
 from joblib import Parallel, delayed
 
@@ -89,7 +90,7 @@ cdef inline np.double_t balltree_min_dist_dual(
     np.double_t radius2,
     np.intp_t node1,
     np.intp_t node2,
-    np.double_t[:, ::1] centroid_dist) nogil except -1:
+    np.double_t[:, ::1] centroid_dist) except -1 nogil:
 
     cdef np.double_t dist_pt = centroid_dist[node1, node2]
     return max(0, (dist_pt - radius1 - radius2))
@@ -139,7 +140,7 @@ cdef inline np.double_t kdtree_min_rdist_dual(
     np.intp_t node1,
     np.intp_t node2,
     np.double_t[:, :, ::1] node_bounds,
-    np.intp_t num_features) nogil except -1:
+    np.intp_t num_features) except -1 nogil:
 
     cdef np.double_t d, d1, d2, rdist = 0.0
     cdef np.double_t zero = 0.0
@@ -322,7 +323,8 @@ cdef class KDTreeBoruvkaAlgorithm (object):
     cdef np.double_t *bounds_ptr
 
     cdef np.ndarray components
-    cdef np.ndarray core_distance_arr
+    cdef public np.ndarray neighbor_arr
+    cdef public np.ndarray core_distance_arr
     cdef np.ndarray bounds_arr
     cdef np.ndarray _centroid_distances_arr
     cdef np.ndarray component_of_point_arr
@@ -437,6 +439,7 @@ cdef class KDTreeBoruvkaAlgorithm (object):
                 dualtree=True,
                 breadth_first=True)
 
+        self.neighbor_arr = knn_indices[:, 1:]
         self.core_distance_arr = knn_dist[:, self.min_samples].copy()
         self.core_distance = (<np.double_t[:self.num_points:1]> (
             <np.double_t *> self.core_distance_arr.data))
@@ -601,7 +604,7 @@ cdef class KDTreeBoruvkaAlgorithm (object):
         return self.components.shape[0]
 
     cdef int dual_tree_traversal(self, np.intp_t node1,
-                                 np.intp_t node2) nogil except -1:
+                                 np.intp_t node2) except -1 nogil:
         """Perform a dual tree traversal, pruning wherever possible, to find
         the nearest neighbor not in the same component for each component.
         This is akin to a standard dual tree NN search, but we also prune
@@ -931,7 +934,8 @@ cdef class BallTreeBoruvkaAlgorithm (object):
     cdef np.double_t *bounds_ptr
 
     cdef np.ndarray components
-    cdef np.ndarray core_distance_arr
+    cdef public np.ndarray core_distance_arr
+    cdef public np.ndarray neighbor_arr
     cdef np.ndarray bounds_arr
     cdef np.ndarray _centroid_distances_arr
     cdef np.ndarray component_of_point_arr
@@ -1041,6 +1045,7 @@ cdef class BallTreeBoruvkaAlgorithm (object):
                 dualtree=True,
                 breadth_first=True)
 
+        self.neighbor_arr = knn_indices[:, 1:]
         self.core_distance_arr = knn_dist[:, self.min_samples].copy()
         self.core_distance = (<np.double_t[:self.num_points:1]> (
             <np.double_t *> self.core_distance_arr.data))
@@ -1283,7 +1288,8 @@ cdef class BallTreeBoruvkaAlgorithm (object):
         #       propagate the results up the tree.
         if node1_info.is_leaf and node2_info.is_leaf:
 
-            new_bound = 0.0
+            new_upper_bound = 0.0
+            new_lower_bound = DBL_MAX
 
             point_indices1 = self.idx_array[node1_info.idx_start:
                                             node1_info.idx_end]

@@ -163,6 +163,40 @@ Based on the paper:
     *"Rates of convergence for the cluster tree."*
     In Advances in Neural Information Processing Systems, 2010.
 
+----------------
+Branch detection
+----------------
+
+The hdbscan package supports a branch-detection post-processing step 
+by `Bot et al. <https://peerj.com/articles/cs-2792/>`_. Cluster shapes,
+such as branching structures, can reveal interesting patterns 
+that are not expressed in density-based cluster hierarchies. The 
+BranchDetector class mimics the HDBSCAN API and can be used to
+detect branching hierarchies in clusters. It provides condensed 
+branch hierarchies, branch persistences, and branch memberships and 
+supports joblib's caching functionality. A notebook 
+`demonstrating the BranchDetector is available <http://nbviewer.jupyter.org/github/scikit-learn-contrib/hdbscan/blob/master/notebooks/How%20to%20detect%20branches.ipynb>`_.
+
+Example usage:
+
+.. code:: python
+
+    import hdbscan
+    from sklearn.datasets import make_blobs
+
+    data, _ = make_blobs(1000)
+
+    clusterer = hdbscan.HDBSCAN(branch_detection_data=True).fit(data)
+    branch_detector = hdbscan.BranchDetector().fit(clusterer)
+    branch_detector.cluster_approximation_graph_.plot(edge_width=0.1)
+
+
+Based on the paper:
+    D.M. Bot, J. Peeters, J. Liesenborgs and J. Aerts
+    *FLASC: a flare-sensitive clustering algorithm.*
+    PeerJ Computer Science, Vol 11, April 2025, e2792.
+    https://doi.org/10.7717/peerj-cs.2792.
+
 ----------
 Installing
 ----------
@@ -298,6 +332,28 @@ To reference the high performance algorithm developed in this library please cit
       pages={33--42},
       year={2017},
       organization={IEEE}
+    }
+
+If you used the branch-detection functionality in this library please cite our `PeerJ paper <https://peerj.com/articles/cs-2792/>`_: 
+
+    Bot DM, Peeters J, Liesenborgs J, Aerts J. 
+    *FLASC: a flare-sensitive clustering algorithm.*
+    In: PeerJ Computer Science, Volume 11, e2792, 2025.
+    https://doi.org/10.7717/peerj-cs.2792 
+
+.. code:: bibtex
+
+    @article{bot2025flasc,
+        title   = {{FLASC: a flare-sensitive clustering algorithm}},
+        author  = {Bot, Dani{\"{e}}l M. and Peeters, Jannes and Liesenborgs, Jori and Aerts, Jan},
+        year    = {2025},
+        month   = {apr},
+        journal = {PeerJ Comput. Sci.},
+        volume  = {11},
+        pages   = {e2792},
+        issn    = {2376-5992},
+        doi     = {10.7717/peerj-cs.2792},
+        url     = {https://peerj.com/articles/cs-2792},
     }
 
 ---------
